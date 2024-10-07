@@ -9,7 +9,7 @@ const projectsData: Project[] = [
   {
     title: 'sharpe',
     description: `sharpe is a unified, interactive, general-purpose environment for backtesting or applying machine learning(supervised learning and reinforcement learning) in the context of quantitative trading.`,
-    imgSrc: '/static/images/Reinforcement-learning.webp',
+    imgSrc: '/static/images/google.png',
     href: 'https://github.com/StateOfTheArt-quant/sharpe',
   },
   {
