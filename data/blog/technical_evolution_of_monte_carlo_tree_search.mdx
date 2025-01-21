@@ -1,0 +1,456 @@
+---
+title: '蒙特卡洛树搜索（Monte Carlo Tree Search）的技术演进： 从UCT到Stochastic MuZero (1)'
+date: '2025-01-21'
+lastmod: '2025-01-21'
+tags: ['规划','最优控制', '强化学习', 'guide']
+draft: false
+summary: '在这篇文章中，我通过 high-level 的视角，探究蒙特卡洛树搜索的技术演进路线,揭示不同性质的MDP如何应用于蒙特卡洛树搜索以解决复杂的序列决策问题'
+images: ['/static/images/twitter-card.png']
+---
+
+## 前言
+
+如果读过AlphaGo, MuZero的原始论文，或者被最近大语言模型的推理（reasoning）能力所惊艳，你会发现，这些工作背后的真正主角是一个被称作蒙特卡洛树搜索（Monte Carlo Tree Search）的算法，这个算法的原始版本是一个纯规划算法，但与深度强化学习算法结合之后，衍生出了强大的learning by planning的能力，从2016年的AlphaGo(Silver, David, et al. 2016)问世，DeepMind陆续推出了AlphaZero(Silver, David, et al. 2017), MuZero(Schrittwieser, Julian, et al. 2020), Sampled MuZero(Hubert, Thomas, et al. 2021), Stochastic Muzero(Antonoglou, Ioannis, et al. 2021)以及LLM with MCTS等一系列围绕强化学习叠加蒙特卡洛树搜索的工作，这几个算法的核心区别在于如何改变原始的蒙特卡洛树搜索算法，以适应不同性质的马尔可夫决策过程（*Markov Decision Process*, MDP）。
+
+- AlphaZero: apply MTCS to  MDP（离散动作空间，a known 确定性的状态转移函数）
+- MuZero: apply MTCS to MDP（离散动作空间， a learned 确定性的状态转移函数）
+- Sampled MuZero: apply MTCS to MDP（连续动作空间， a learned 确定性的状态转移函数）
+- Stochastic Muzero: apply MTCS to MDP（离散动作空间， a learned 随机性的状态转移函数）
+
+在这篇博客中，我会以蒙特卡洛树为主角，探究她出现的动机，定义，流程以及演进路线，因此会摒弃与该技术无关的概念和细节，梳理清楚蒙特卡洛树的前世今生，目录如下
+
+- Part I: 基于蒙特卡洛模拟的规划算法
+- Part II: UCT算法(Upper Confidence Bounds *applied* *to* *Trees*,*UCT*)
+- Part III: AlphaZero算法
+- Part IV: MuZero算法
+- Part V: Sampled Muzero算法
+- Part VI: Stochastic Muzero算法
+
+## Part I: 基于蒙特卡洛模拟的规划算法（Monte Carlo-based Planning）
+
+序列决策问题（规划，最优控制和强化学习）中最核心的一个概念是给定一个状态下最优动作的选择问题，即给定一个具体的状态state, 给定这个状态下可选的动作有k个，分别为a_1, a_2, …, a_k, 一个决策主体，到底应该选择哪个动作，能保证未来整体收益最大化？ 其中一种解决该问题的思路是这样的: 因为这个问题下的MDP已知(即状态转移函数以及奖励函数已知)，那么我可以从这个state出发，选择一个具体的动作a_1, 然后基于MDP一直模拟到结束，然后统计下，从state,a_1出发后的累计收益，将这个状态-动作对的价值记为Q（state, a_1）,如果只模拟一次，得到的值具有随机性，我可以模拟num_simulation=100,来计算一个平均值。 同样的，按这种模特卡洛模拟的方式，我们可以得到从state出发，任何一个状态动作对的价值的估计值。然后在这个状态下，选择那个状态-动作值最大的所对应的动作。我们把这种最优动作的选择方法叫做基于蒙特卡洛模拟的规划算法。代码如下
+~~~
+import random
+
+class SimpleMDP:
+    def __init__(self):
+        self.state_space = [0, 1, 2, 3]  # 4 states
+        self.action_space = [0, 1, 2]    # 3 actions
+        self.transitions = {
+            0: {0: 1, 1: 2, 2: 3},
+            1: {0: 0, 1: 2, 2: 3},
+            2: {0: 1, 1: 3, 2: 0},
+            3: {0: 3, 1: 3, 2: 3}  # Terminal state
+        }
+        self.rewards = {0: 0, 1: 1, 2: 5, 3: 10}  # Reward for reaching each state
+        self.terminal_state = 3  # Terminal state
+
+    def step(self, state, action):
+        next_state = self.transitions[state][action]
+        reward = self.rewards[next_state]
+        return next_state, reward
+
+    def is_terminal(self, state):
+        return state == self.terminal_state
+
+def rollout_based_monte_carlo_planning(mdp, current_state, num_rollouts):
+    action_values = {action: 0 for action in mdp.action_space}
+    
+    for action in mdp.action_space:
+        total_reward = 0
+        for _ in range(num_rollouts):
+            state = current_state
+            reward_sum = 0
+            # First step: take the action we are evaluating
+            next_state, reward = mdp.step(state, action)
+            reward_sum += reward
+            state = next_state
+            # Subsequent steps: take random actions until terminal state is reached
+            while not mdp.is_terminal(state):
+                random_action = random.choice(mdp.action_space)  # Random action selection
+                next_state, reward = mdp.step(state, random_action)
+                reward_sum += reward
+                state = next_state
+            total_reward += reward_sum
+        action_values[action] = total_reward / num_rollouts  # Average reward
+
+    best_action = max(action_values, key=action_values.get)
+    return best_action, action_values
+
+if __name__ == "__main__":
+    # Rollout-Based Monte Carlo Planning
+    mdp = SimpleMDP()
+    current_state = 0
+    best_action, action_values = rollout_based_monte_carlo_planning(mdp, current_state, 100)
+    print(f"Best action: {best_action}, Action values: {action_values}")
+~~~
+
+把这个算法成为规划算法，是因为在一个具体的state位置，我们用一个可以预知未来走向的水晶球(已知的MDP)去占卜每一个动作未来的总收益， 然后基于占卜，选择那个总收益最大的动作。
+
+当num_simulation的次数足够大时，每一个状态-动作对的价值估计是无偏估计，选择的动作就是最优动作。但这个方法存在的问题是1计算量大，2蒙特卡洛模拟过程中的随机动作选择以及3无记忆性下的计算效率低等问题。
+
+1. 计算量大: 该算法的计算量大体现在，给定一个状态，该算法会对每一个动作，都做num_simulation次的蒙特卡洛模拟，也就是代码中的这一步：
+~~~
+    for action in mdp.action_space:
+        total_reward = 0
+        for _ in range(num_rollouts):
+~~~
+这在解决真实问题时，尤其是决策具有延迟敏感性的时候比如自动驾驶决策，是不可行的。
+
+2. 蒙特卡洛模拟过程中的随机动作选择问题  
+在蒙特卡洛模拟模拟阶段，每次生成一个轨迹(trajectory, 也被称为一个rollout)的过程中，除了第一步的动作是固定的，后续的动作选择是完全随机的。这种随机性可能导致模拟的效率低下，尤其是在状态空间较大的情况下，随机动作选择可能会浪费大量时间在低回报的路径上。本质上说现在的动作选择是基于一个均匀分布的采样，这种采样动作的方式非常低效，忽略了过程中更有价值的动作选择,从而对缺少对状态-动作对的价值的准确评估。
+~~~
+while not mdp.is_terminal(state):
+      random_action = random.choice(mdp.action_space)  # Random action selection
+      next_state, reward = mdp.step(state, random_action)
+~~~
+
+3. 无记忆性导致的计算效率低: 基于MDP生成N条轨迹，其中很多个轨迹有可能是完全一样（极端的情况），或者不同轨迹某一些片段是完全一样，上述的算法不存在缓存或者记忆机制，减少一致片段的重复计算，而是在每次在蒙特卡洛模拟时，都是完全模拟一次MDP的全过程，这个过程时间开销很大。
+
+## Part II: UCT算法(Upper Confidence Bounds applied to Trees,UCT)
+如何解决无记忆性导致的计算效率低的问题? Leslie Pack Kaelbling, Michael L. Littman, and Anthony R. Cassandra (1998)在《**Planning and Acting in Partially Observable Stochastic Domains**》给出了一个很好的解决办法： **MDP（马尔可夫决策过程）可以被一个树结构表示。**
+
+MDP由状态空间 *S*、动作空间 *A*、转移概率 *P*(*s*′∣*s*,*a*) 和奖励函数*R*(*s*,*a*,*s*′) 组成。在树结构中，每个状态和动作的组合都会导致一个或多个可能的下一个状态。这种状态转移的层次结构可以自然地表示为一棵树：
+
+1. **树的根节点**：表示初始状态。
+2. **树的内部节点**：表示非终止状态。
+3. **树的叶子节点**：表示终止状态或达到某个深度限制的状态。
+4. **树的边**：表示从一个状态通过某个动作转移到下一个状态。
+
+通过这种树结构，MDP的所有可能状态和动作序列可以被系统地表示出来。树的每一层对应一个时间步，每个节点对应一个状态，每个边对应一个动作。
+
+树结构的一个关键作用是**避免重复计算**，从而解决记忆性问题。具体来说：
+
+1. **状态和动作的存储**：
+    - 在树结构中，每个节点存储了对应的状态信息，每条边存储了对应的动作信息。这样，当算法需要访问某个状态或动作时，可以直接从树中检索，而不需要重新计算。
+2. **路径的唯一性**：
+    - 树结构确保了从根节点到任意节点的路径是唯一的。这意味着每个状态和动作序列只会被计算一次，避免了重复计算。
+3. **回溯更新**：
+    - 在树结构中，算法可以通过回溯更新节点的统计信息（如访问次数和平均回报）。这种回溯更新机制使得算法能够利用之前计算的结果，从而避免重复计算。
+    
+针对问题1和2,这两个问题的背后面临一个共同的困境：给定一个状态，基于模特卡罗模拟的规划算法，是基于均匀分布进行采样，对每个动作的选择没有任何偏好，如何给有价值的动作赋予更高的选择概率，同时兼顾探索(exploration)和利用(exploitation)是解决问题1和2的核心， [Rémi Coulom](https://en.wikipedia.org/wiki/R%C3%A9mi_Coulom) (2007)在Efficient Selectivity and Backup Operators in Monte-Carlo Tree Search直指基于蒙特卡洛模拟的策略评估中的两个问题
+
+1. **选择操作（Selectivity）的效率问题**：在动作选择阶段，如何更高效地平衡探索（exploration）和利用（exploitation），以避免陷入次优策略。
+2. **备份操作（Backup）的效率问题**：在模特卡洛模拟阶段结束后，如何更有效地将模拟结果反向传播（backup）到树中，以更新节点的统计信息。
+
+并首次提出蒙特卡洛树搜索这个概念。Kocsis, L., & Szepesvári, C. (2006) 将经典bandit问题中UCB算法引入MDP过程中的动作选择问题，在论文《Bandit based Monte-Carlo Planning》提出了著名的UCT算法(Upper Confidence Bounds *applied* *to* *Trees*,*UCT*)，构成了现代蒙特卡洛树搜索的雏形。Chaslot, Guillaume M. Jb, et al.(2008)在Progressive strategies for Monte-Carlo tree search对蒙特卡洛树搜索算法给出了系统性的理论框架，通过引入渐进式策略，解决了MCTS在探索与利用平衡、资源分配和动态环境适应方面的关键问题。
+    
+MDP过程可以被一个树结构所表示，在树结构中，每个节点对应一个状态，每个边对应一个动作，树的每一层对应一个时间步。
+~~~
+class NaiveUCTNode:
+    def __init__(self, state, parent=None, prior=0):
+        self.state = state  # Current state in the MDP
+        self.is_expanded = False
+        self.parent = parent  # Parent node
+        self.children = {}  # Dictionary of actions to child nodes
+        self.prior = prior  # Prior probability of the node
+        self.total_value = 0  # Cumulative reward from simulations
+        self.number_visits = 0  # Number of times the node has been visited
+~~~
+
+MCTS的流程分为四个阶段，循环执行直到达到计算资源限制或终止条件：
+
+### **阶段 1：选择（Selection）**
+
+- 从根节点（当前状态）开始，递归选择一个子节点，直到到达一个**未完全扩展的节点**（即存在未尝试的动作）。
+- 选择策略通常基于**UCB1公式**（Upper Confidence Bound）：
+
+$\text{UCB1}(s, a) = \frac{Q(s, a)}{N(s, a)} + c \cdot \sqrt{\frac{\ln N(s)}{N(s, a)}}$
+    - $Q(s, a)$：动作a的累计奖励。
+    - N(s, a)：动作a 的访问次数。
+    - N(s)：状态s的总访问次数。
+    - c：探索常数，控制探索与利用的平衡。
+
+~~~
+    def Q(self):
+        """Compute the average reward (exploitation term)."""
+        return self.total_value / (1 + self.number_visits)
+
+    def U(self):
+        """Compute the exploration term."""
+        if self.parent is None:
+            return 0  # Root node has no exploration term
+        return (math.sqrt(self.parent.number_visits) * self.prior) / (1 + self.number_visits)
+
+    def best_child(self):
+          return max(self.children.values(),
+               key=lambda node: node.Q() + node.U())
+
+    def select_leaf(self):
+        current = self
+        while current.is_expanded:
+            current = current.best_child()
+        return current
+~~~
+
+### **阶段 2：扩展（Expansion）**
+
+- 如果当前节点不是终止状态，且存在未尝试的动作，则选择一个（或者直接选择多个）未尝试的动作，扩展一个(或多个)新的子节点。
+- 新节点初始化为：
+    - 访问次数 N(s)。
+    - 累计奖励 Q(s) = 0 。
+~~~
+    def expand(self, mdp):
+        """Expand the node by generating child nodes for all legal actions."""
+        if mdp.is_terminal(self.state):  # 如果是终结状态，直接返回
+            self.is_expanded = False
+            return
+        legal_actions = mdp.get_legal_actions(self.state)
+        if not legal_actions:  # 如果没有合法动作，标记为已扩展
+            self.is_expanded = False
+            return
+        for action in legal_actions:
+            next_state, reward = mdp.step(self.state, action)
+            self.children[action] = NaiveUCTNode(next_state, parent=self, prior=1)  # Uniform prior
+        #if self.state == (4,3):
+            #pdb.set_trace()
+        self.is_expanded = True
+~~~
+
+### **阶段 3：模拟（Simulation）**
+- 从新扩展的节点开始，随机选择动作进行模拟，直到达到终止状态。
+- 模拟结束后，得到一个奖励值 R。
+~~~
+    def rollout(self, mdp):
+        """Perform a random simulation from the current state."""
+        current_state = self.state
+        if mdp.is_terminal(current_state):
+            return mdp.terminal_reward
+        
+        total_reward = 0
+        while not mdp.is_terminal(current_state):
+            possible_actions = mdp.get_legal_actions(current_state)
+            if not possible_actions:  # 如果没有合法动作，终止模拟
+                break
+            action = self.rollout_policy(possible_actions)
+            current_state, reward = mdp.step(current_state, action)
+            total_reward += reward
+        return total_reward
+
+    def rollout_policy(self, possible_actions):
+        """Randomly select an action for rollout."""
+        return possible_actions[np.random.randint(len(possible_actions))]
+~~~
+
+### **阶段 4：回溯（Backpropagation）**
+
+- 将模拟结果 \( R \) 回溯更新到从新节点到根节点的路径上的所有节点。
+- 更新规则：
+    - 访问次数 $N(s) \leftarrow N(s) + 1$ 。
+    - 累计奖励 $Q(s, a) \leftarrow Q(s, a) + R$。
+~~~
+    def backpropagate(self, value_estimate):
+        """Backpropagate the value estimate up the tree."""
+        current = self
+        while current is not None:
+            current.number_visits += 1
+            current.total_value += value_estimate
+            current = current.parent
+~~~
+至此，一个完整的节点已经构成，代码如下
+~~~
+import math
+import numpy as np
+
+class NaiveUCTNode:
+    def __init__(self, state, parent=None, prior=0):
+        self.state = state  # Current state in the MDP
+        self.is_expanded = False
+        self.parent = parent  # Parent node
+        self.children = {}  # Dictionary of actions to child nodes
+        self.prior = prior  # Prior probability of the node
+        self.total_value = 0  # Cumulative reward from simulations
+        self.number_visits = 0  # Number of times the node has been visited
+
+    def Q(self):
+        """Compute the average reward (exploitation term)."""
+        return self.total_value / (1 + self.number_visits)
+
+    def U(self):
+        """Compute the exploration term."""
+        if self.parent is None:
+            return 0  # Root node has no exploration term
+        return (math.sqrt(self.parent.number_visits) * self.prior) / (1 + self.number_visits)
+
+    def best_child(self):
+          return max(self.children.values(),
+               key=lambda node: node.Q() + node.U())
+
+    def select_leaf(self):
+        current = self
+        while current.is_expanded:
+            current = current.best_child()
+        return current
+    
+    def expand(self, mdp):
+        """Expand the node by generating child nodes for all legal actions."""
+        if mdp.is_terminal(self.state):  # 如果是终结状态，直接返回
+            self.is_expanded = False
+            return
+        legal_actions = mdp.get_legal_actions(self.state)
+        if not legal_actions:  # 如果没有合法动作，标记为已扩展
+            self.is_expanded = False
+            return
+        for action in legal_actions:
+            next_state, reward = mdp.step(self.state, action)
+            self.children[action] = NaiveUCTNode(next_state, parent=self, prior=1)  # Uniform prior
+        #if self.state == (4,3):
+            #pdb.set_trace()
+        self.is_expanded = True
+
+    def backpropagate(self, value_estimate):
+        """Backpropagate the value estimate up the tree."""
+        current = self
+        while current is not None:
+            current.number_visits += 1
+            current.total_value += value_estimate
+            current = current.parent
+
+    def rollout(self, mdp):
+        """Perform a random simulation from the current state."""
+        current_state = self.state
+        if mdp.is_terminal(current_state):
+            return mdp.terminal_reward
+        
+        total_reward = 0
+        while not mdp.is_terminal(current_state):
+            possible_actions = mdp.get_legal_actions(current_state)
+            if not possible_actions:  # 如果没有合法动作，终止模拟
+                break
+            action = self.rollout_policy(possible_actions)
+            current_state, reward = mdp.step(current_state, action)
+            total_reward += reward
+        return total_reward
+
+    def rollout_policy(self, possible_actions):
+        """Randomly select an action for rollout."""
+        return possible_actions[np.random.randint(len(possible_actions))]
+
+~~~
+
+基于树节点的UCT搜索(规划)算法如下
+~~~
+def naive_UCT_search(root, mdp, num_reads):
+    for _ in range(num_reads):
+        leaf = root.select_leaf()
+        leaf.expand(mdp)
+        value = leaf.rollout(mdp)
+        leaf.backpropagate(value)
+    best_action, best_node = max(root.children.items(), key=lambda item: item[1].number_visits)
+    return best_action, best_node
+~~~
+
+给定一个MDP环境，一个minimal的可运行示例如下
+~~~
+class GridWorldMDP:
+    def __init__(self, size=5, obstacles=None, goal=None,terminal_reward = 10):
+        """
+        Initialize the Grid World MDP.
+
+        Args:
+            size (int): Size of the grid (size x size).
+            obstacles (list): List of obstacle positions [(x1, y1), (x2, y2), ...].
+            goal (tuple): Goal position (x, y).
+        """
+        self.size = size
+        self.obstacles = obstacles if obstacles else [(1, 1), (2, 2), (3, 3)]  # Default obstacles
+        self.goal = goal if goal else (size - 1, size - 1)  # Default goal at top-right corner
+        self.state = (0, 0)  # Start at bottom-left corner
+        self.terminal_reward = terminal_reward
+
+    def get_legal_actions(self, state):
+        """Return possible actions from the current state."""
+        x, y = state
+        actions = []
+        if x > 0 and (x - 1, y) not in self.obstacles:  # Left
+            actions.append("Left")
+        if x < self.size - 1 and (x + 1, y) not in self.obstacles:  # Right
+            actions.append("Right")
+        if y > 0 and (x, y - 1) not in self.obstacles:  # Down
+            actions.append("Down")
+        if y < self.size - 1 and (x, y + 1) not in self.obstacles:  # Up
+            actions.append("Up")
+        return actions
+
+    def step(self, state, action):
+        """Simulate the transition and return the next state and reward."""
+        x, y = state
+        if action == "Left" and x > 0 and (x - 1, y) not in self.obstacles:
+            next_state = (x - 1, y)
+        elif action == "Right" and x < self.size - 1 and (x + 1, y) not in self.obstacles:
+            next_state = (x + 1, y)
+        elif action == "Down" and y > 0 and (x, y - 1) not in self.obstacles:
+            next_state = (x, y - 1)
+        elif action == "Up" and y < self.size - 1 and (x, y + 1) not in self.obstacles:
+            next_state = (x, y + 1)
+        else:
+            next_state = state  # Illegal action, state remains unchanged
+
+        # Calculate reward
+        if next_state == self.goal:
+            reward = self.terminal_reward  # Reach goal
+        elif next_state in self.obstacles:
+            reward = -5  # Hit obstacle
+        else:
+            reward = -1  # Default reward
+
+        return next_state, reward
+
+    def is_terminal(self, state):
+        """Check if the state is terminal."""
+        return state == self.goal
+
+if __name__ == "__main__":
+    # Initialize the Grid World MDP
+    mdp = GridWorldMDP(size=5)
+    
+    state = (4, 3)
+    action = "Up"  # Move to (4, 4) which is the goal
+    next_state, reward = mdp.step(state, action)
+    print(mdp.is_terminal(next_state))
+    
+    # # Test reward logic
+    # print("Testing reward logic:")
+    # test_rewards(mdp)
+
+    # Create the root node
+    root = NaiveUCTNode(mdp.state)
+
+    # Run MCTS
+    print("\nRunning MCTS...")
+    best_action, best_node = naive_UCT_search(root, mdp, num_reads=1000)
+    if best_action is None:
+        print("No legal actions found.")
+    else:
+        print(f"Best action: {best_action}, Visits: {best_node.number_visits}, Value: {best_node.Q()}")
+~~~
+
+### 总结
+
+Part I的部分，给出了基于蒙特卡洛模拟的规划算法，这是最简单通用的一类规划算法，同时也指出了该算法存在的两个核心缺点：1 基于均匀分布采样动作，无法给有价值的动作赋予更高的选择概率，从而在探索阶段可能会浪费大量资源在低价值的动作上，从而降低算法的效率和效果; 2是无记忆性导致的计算效率低。解决问题2的思路是使用数据结构表示一个MDP的过程，解决问题2的思路是将每一个次的动选选择都视为一个bandit的选择问题。Part II给出了解决这里两个问题基本思想，给出蒙特卡洛树搜索出现的动机，概念的发展路线，最后给出现代蒙特卡洛树搜索算法（UCT）及代码。UCT的出现为后续结合深度学习的蒙特卡洛树搜索算法提供了结实的理论框架。
+
+#### 参考文献
+
+Kocsis, L., & Szepesvári, C. (2006). Bandit based Monte-Carlo Planning. In *European Conference on Machine Learning* (pp. 282-293). Springer.
+
+Browne, C. B., et al. (2012). A Survey of Monte Carlo Tree Search Methods. *IEEE Transactions on Computational Intelligence and AI in Games*, 4(1), 1-43.
+
+Kaelbling, L.P., Littman, M.L. and Cassandra, A.R., 1998. Planning and acting in partially observable stochastic domains. *Artificial intelligence*, *101*(1-2), pp.99-134.
+
+Coulom, R., 2006, May. Efficient selectivity and backup operators in Monte-Carlo tree search. In *International conference on computers and games* (pp. 72-83). Berlin, Heidelberg: Springer Berlin Heidelberg.
+
+Kocsis, L., & Szepesvári, C. (2006). Bandit based Monte-Carlo Planning. In European Conference on Machine Learning (pp. 282-293). Springer, Berlin, Heidelberg
+
+Chaslot, G.M.J., Winands, M.H., Herik, H.J.V.D., Uiterwijk, J.W. and Bouzy, B., 2008. Progressive strategies for Monte-Carlo tree search. *New Mathematics and Natural Computation*, *4*(03), pp.343-357.
+
+Silver, D., Huang, A., Maddison, C.J., Guez, A., Sifre, L., Van Den Driessche, G., Schrittwieser, J., Antonoglou, I., Panneershelvam, V., Lanctot, M. and Dieleman, S., 2016. Mastering the game of Go with deep neural networks and tree search. *nature*, *529*(7587), pp.484-489.
+
+Silver, D., Hubert, T., Schrittwieser, J., Antonoglou, I., Lai, M., Guez, A., Lanctot, M., Sifre, L., Kumaran, D., Graepel, T. and Lillicrap, T., 2017. Mastering chess and shogi by self-play with a general reinforcement learning algorithm. *arxiv preprint arxiv:1712.01815*.
+
+Schrittwieser, J., Antonoglou, I., Hubert, T., Simonyan, K., Sifre, L., Schmitt, S., Guez, A., Lockhart, E., Hassabis, D., Graepel, T. and Lillicrap, T., 2020. Mastering atari, go, chess and shogi by planning with a learned model. *Nature*, *588*(7839), pp.604-609.
+
+Hubert, T., Schrittwieser, J., Antonoglou, I., Barekatain, M., Schmitt, S. and Silver, D., 2021, July. Learning and planning in complex action spaces. In *International Conference on Machine Learning* (pp. 4476-4486). PMLR.
+
+Antonoglou, I., Schrittwieser, J., Ozair, S., Hubert, T.K. and Silver, D., 2021, October. Planning in stochastic environments with a learned model. In *International Conference on Learning Representations*.
+
+
